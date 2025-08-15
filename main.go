@@ -5,9 +5,12 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"net/http"
 	"strings"
 	"time"
 
+	"google.golang.org/api/cloudresourcemanager/v3"
+	"google.golang.org/api/googleapi"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/yaml"
 )
@@ -20,6 +23,52 @@ type Config struct {
 	SetupCommands  []string `yaml:"setupCommands"`
 }
 
+type ProjectManager struct {
+	config *Config
+
+	crmService *cloudresourcemanager.Service
+}
+
+func NewProjectManager(config *Config) *ProjectManager {
+	return &ProjectManager{config: config}
+}
+
+func (p *ProjectManager) getCloudResourceManagerClient(ctx context.Context) (*cloudresourcemanager.Service, error) {
+	if p.crmService != nil {
+		return p.crmService, nil
+	}
+	crmService, err := cloudresourcemanager.NewService(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("error creating cloudresourcemanager client: %w", err)
+	}
+	p.crmService = crmService
+	return crmService, nil
+}
+
+func (p *ProjectManager) EnsureProjectExists(ctx context.Context, projectName string) error {
+	log := klog.FromContext(ctx)
+
+	crmService, err := p.getCloudResourceManagerClient(ctx)
+	if err != nil {
+		return err
+	}
+
+	project, err := getProject(ctx, crmService, projectName)
+	if err != nil {
+		return err
+	}
+	if project == nil {
+		log.Info("project does not exist, creating", "name", projectName)
+		if err := createProject(ctx, crmService, projectName, p.config); err != nil {
+			return err
+		}
+	} else {
+		log.Info("project already exists", "name", projectName)
+	}
+	return nil
+}
+
+
 func main() {
 	ctx := context.Background()
 	if err := run(ctx); err != nil {
@@ -29,10 +78,14 @@ func main() {
 }
 
 func run(ctx context.Context) error {
+	klog.InitFlags(nil)
+
 	configPath := ""
 	flag.StringVar(&configPath, "config", configPath, "Path to the configuration file")
-	klog.InitFlags(nil)
 	flag.Parse()
+
+	logger := klog.NewKlogr()
+	ctx = klog.NewContext(ctx, logger)
 
 	if configPath == "" {
 		return fmt.Errorf("config file path must be specified with -config flag")
@@ -47,11 +100,57 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("error expanding project name: %w", err)
 	}
 
-	klog.Infof("Project name: %s", projectName)
-	// TODO: Create project
+	log := klog.FromContext(ctx)
+	log.Info("Project name", "name", projectName)
+
+	projectManager := NewProjectManager(config)
+	if err := projectManager.EnsureProjectExists(ctx, projectName); err != nil {
+		return err
+	}
+
 	// TODO: Enable services
 	// TODO: Run setup commands
 	return nil
+}
+
+func createProject(ctx context.Context, crmService *cloudresourcemanager.Service, projectName string, config *Config) error {
+	project := &cloudresourcemanager.Project{
+		ProjectId:   projectName,
+		DisplayName: projectName,
+		Parent:      config.Parent,
+	}
+	op, err := crmService.Projects.Create(project).Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("error creating project: %w", err)
+	}
+
+	for !op.Done {
+		time.Sleep(2 * time.Second)
+		op, err = crmService.Operations.Get(op.Name).Context(ctx).Do()
+		if err != nil {
+			return fmt.Errorf("error getting operation status: %w", err)
+		}
+	}
+
+	if op.Error != nil {
+		return fmt.Errorf("error from project creation operation: %v", op.Error)
+	}
+	log := klog.FromContext(ctx)
+	log.Info("project created", "name", projectName)
+	return nil
+}
+
+// getProject gets the project, returning nil if it does not exist
+func getProject(ctx context.Context, crmService *cloudresourcemanager.Service, projectName string) (*cloudresourcemanager.Project, error) {
+	// TODO: Search instead of get
+	resp, err := crmService.Projects.Get("projects/" + projectName).Context(ctx).Do()
+	if err != nil {
+		if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == http.StatusNotFound {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("error getting project: %w", err)
+	}
+	return resp, nil
 }
 
 func loadConfig(path string) (*Config, error) {
