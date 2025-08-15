@@ -21,9 +21,6 @@ type Config struct {
 }
 
 func main() {
-	klog.InitFlags(nil)
-	flag.Parse()
-
 	ctx := context.Background()
 	if err := run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -32,8 +29,14 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	// TODO: Find configs in a well-known path
-	configPath := "config/default.yaml"
+	configPath := ""
+	flag.StringVar(&configPath, "config", configPath, "Path to the configuration file")
+	klog.InitFlags(nil)
+	flag.Parse()
+
+	if configPath == "" {
+		return fmt.Errorf("config file path must be specified with -config flag")
+	}
 	config, err := loadConfig(configPath)
 	if err != nil {
 		return fmt.Errorf("error loading config %q: %w", configPath, err)
