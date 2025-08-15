@@ -4,8 +4,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"os"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -48,18 +48,13 @@ func (p *ProjectManager) getCloudResourceManagerClient(ctx context.Context) (*cl
 func (p *ProjectManager) EnsureProjectExists(ctx context.Context, projectName string) error {
 	log := klog.FromContext(ctx)
 
-	crmService, err := p.getCloudResourceManagerClient(ctx)
-	if err != nil {
-		return err
-	}
-
-	project, err := getProject(ctx, crmService, projectName)
+	project, err := p.getProject(ctx, projectName)
 	if err != nil {
 		return err
 	}
 	if project == nil {
 		log.Info("project does not exist, creating", "name", projectName)
-		if err := createProject(ctx, crmService, projectName, p.config); err != nil {
+		if err := p.createProject(ctx, projectName); err != nil {
 			return err
 		}
 	} else {
@@ -67,7 +62,6 @@ func (p *ProjectManager) EnsureProjectExists(ctx context.Context, projectName st
 	}
 	return nil
 }
-
 
 func main() {
 	ctx := context.Background()
@@ -113,11 +107,15 @@ func run(ctx context.Context) error {
 	return nil
 }
 
-func createProject(ctx context.Context, crmService *cloudresourcemanager.Service, projectName string, config *Config) error {
+func (p *ProjectManager) createProject(ctx context.Context, projectName string) error {
+	crmService, err := p.getCloudResourceManagerClient(ctx)
+	if err != nil {
+		return err
+	}
 	project := &cloudresourcemanager.Project{
 		ProjectId:   projectName,
 		DisplayName: projectName,
-		Parent:      config.Parent,
+		Parent:      p.config.Parent,
 	}
 	op, err := crmService.Projects.Create(project).Context(ctx).Do()
 	if err != nil {
@@ -141,16 +139,34 @@ func createProject(ctx context.Context, crmService *cloudresourcemanager.Service
 }
 
 // getProject gets the project, returning nil if it does not exist
-func getProject(ctx context.Context, crmService *cloudresourcemanager.Service, projectName string) (*cloudresourcemanager.Project, error) {
+func (p *ProjectManager) getProject(ctx context.Context, projectName string) (*cloudresourcemanager.Project, error) {
+	crmService, err := p.getCloudResourceManagerClient(ctx)
+	if err != nil {
+		return nil, err
+	}
 	// TODO: Search instead of get
 	resp, err := crmService.Projects.Get("projects/" + projectName).Context(ctx).Do()
 	if err != nil {
-		if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == http.StatusNotFound {
+		if isNotFound(err) || isPermissionDenied(err) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("error getting project: %w", err)
 	}
 	return resp, nil
+}
+
+func isNotFound(err error) bool {
+	if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == http.StatusNotFound {
+		return true
+	}
+	return false
+}
+
+func isPermissionDenied(err error) bool {
+	if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == http.StatusForbidden {
+		return true
+	}
+	return false
 }
 
 func loadConfig(path string) (*Config, error) {
