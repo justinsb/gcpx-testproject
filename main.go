@@ -17,6 +17,7 @@ import (
 	"google.golang.org/api/cloudbilling/v1"
 	"google.golang.org/api/cloudresourcemanager/v3"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/iterator"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/yaml"
 )
@@ -32,11 +33,31 @@ type Config struct {
 type ProjectManager struct {
 	config *Config
 
-	crmService *cloudresourcemanager.Service
+	crmService         *cloudresourcemanager.Service
+	serviceusageClient *serviceusage.Client
+	enabledServices    map[string]bool
 }
 
 func NewProjectManager(config *Config) *ProjectManager {
 	return &ProjectManager{config: config}
+}
+
+func (p *ProjectManager) getServiceUsageClient(ctx context.Context) (*serviceusage.Client, error) {
+	if p.serviceusageClient != nil {
+		return p.serviceusageClient, nil
+	}
+	suClient, err := serviceusage.NewClient(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("error creating serviceusage client: %w", err)
+	}
+	p.serviceusageClient = suClient
+	return suClient, nil
+}
+
+func (p *ProjectManager) closeClients() {
+	if p.serviceusageClient != nil {
+		p.serviceusageClient.Close()
+	}
 }
 
 func (p *ProjectManager) getCloudResourceManagerClient(ctx context.Context) (*cloudresourcemanager.Service, error) {
@@ -105,6 +126,7 @@ func run(ctx context.Context) error {
 	log.Info("Project name", "name", projectName)
 
 	projectManager := NewProjectManager(config)
+	defer projectManager.closeClients()
 	if err := projectManager.EnsureProjectExists(ctx, projectName); err != nil {
 		return err
 	}
@@ -212,24 +234,71 @@ func (p *ProjectManager) LinkProjectToBillingAccount(ctx context.Context, projec
 	return nil
 }
 
+func (p *ProjectManager) getEnabledServices(ctx context.Context, projectName string) (map[string]bool, error) {
+	log := klog.FromContext(ctx)
+
+	if p.enabledServices == nil {
+		p.enabledServices = make(map[string]bool)
+
+		suClient, err := p.getServiceUsageClient(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		log.Info("fetching enabled services for project", "project", projectName)
+		req := &serviceusagepb.ListServicesRequest{
+			Parent:   fmt.Sprintf("projects/%s", projectName),
+			Filter:   "state:ENABLED",
+			PageSize: 200,
+		}
+
+		it := suClient.ListServices(ctx, req)
+		for {
+			resp, err := it.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				return nil, fmt.Errorf("error listing enabled services: %w", err)
+			}
+			p.enabledServices[resp.Config.Name] = true
+		}
+		log.Info("fetched enabled services", "count", len(p.enabledServices), "project", projectName)
+	}
+	return p.enabledServices, nil
+}
+
 func (p *ProjectManager) EnableProjectServices(ctx context.Context, projectName string, servicesToEnable []string) error {
 	log := klog.FromContext(ctx)
 
-	suClient, err := serviceusage.NewClient(ctx)
+	enabledServices, err := p.getEnabledServices(ctx, projectName)
 	if err != nil {
-		return fmt.Errorf("error creating serviceusage client: %w", err)
+		return err
 	}
-	defer suClient.Close()
 
-	if len(servicesToEnable) == 0 {
-		log.Info("no services to enable", "project", projectName)
+	var servicesToBatchEnable []string
+	for _, serviceID := range servicesToEnable {
+		if !enabledServices[serviceID] {
+			servicesToBatchEnable = append(servicesToBatchEnable, serviceID)
+		} else {
+			log.Info("service already enabled", "service", serviceID, "project", projectName)
+		}
+	}
+
+	if len(servicesToBatchEnable) == 0 {
+		log.Info("no new services to enable", "project", projectName)
 		return nil
 	}
 
-	log.Info("enabling services", "services", servicesToEnable, "project", projectName)
+	suClient, err := p.getServiceUsageClient(ctx)
+	if err != nil {
+		return err
+	}
+
+	log.Info("enabling services", "services", servicesToBatchEnable, "project", projectName)
 	req := &serviceusagepb.BatchEnableServicesRequest{
 		Parent:     fmt.Sprintf("projects/%s", projectName),
-		ServiceIds: servicesToEnable,
+		ServiceIds: servicesToBatchEnable,
 	}
 
 	op, err := suClient.BatchEnableServices(ctx, req)
@@ -242,7 +311,11 @@ func (p *ProjectManager) EnableProjectServices(ctx context.Context, projectName 
 		return fmt.Errorf("error waiting for batch enable services operation: %w", err)
 	}
 
-	log.Info("services enabled", "services", servicesToEnable, "project", projectName)
+	for _, serviceID := range servicesToBatchEnable {
+		p.enabledServices[serviceID] = true
+	}
+
+	log.Info("services enabled", "services", servicesToBatchEnable, "project", projectName)
 	return nil
 }
 
