@@ -1,5 +1,5 @@
 # config/default.yaml
-namePattern: "default-${USER}-YYYYMMDD"
+namePattern: "default-${env.USER}-${today}"
 parent: "folders/1234567890"
 billingAccount: "billingAccounts/012345-67890A-BCDEF0"
 services:

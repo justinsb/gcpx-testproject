@@ -4,9 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"os/user"
 	"strings"
 	"time"
 
@@ -54,7 +52,7 @@ func run(ctx context.Context) error {
 }
 
 func loadConfig(path string) (*Config, error) {
-	b, err := ioutil.ReadFile(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("error reading config file %q: %w", path, err)
 	}
@@ -66,27 +64,48 @@ func loadConfig(path string) (*Config, error) {
 }
 
 func expandProjectName(pattern string) (string, error) {
-	now := time.Now()
-	date := now.Format("20060102")
-	s := strings.Replace(pattern, "YYYYMMDD", date, -1)
-
-	u, err := user.Current()
-	if err != nil {
-		return "", fmt.Errorf("error getting current user: %w", err)
-	}
-	username := u.Username
-	// Sanitize username - gcloud projects must start with a letter and contain only letters, numbers, and hyphens
-	sanitizedUsername := ""
-	for _, r := range username {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			sanitizedUsername += string(r)
+	var out strings.Builder
+	in := pattern
+	for {
+		i := strings.Index(in, "${")
+		if i == -1 {
+			out.WriteString(in)
+			break
 		}
-	}
-	if len(sanitizedUsername) == 0 {
-		return "", fmt.Errorf("could not build sanitized username from %q", username)
+		out.WriteString(in[:i])
+		in = in[i+2:]
+
+		j := strings.Index(in, "}")
+		if j == -1 {
+			return "", fmt.Errorf("unclosed substitution in pattern %q", pattern)
+		}
+		expr := in[:j]
+		in = in[j+1:]
+
+		var val string
+		switch expr {
+		case "today":
+			val = time.Now().Format("20060102")
+		default:
+			if strings.HasPrefix(expr, "env.") {
+				varName := strings.TrimPrefix(expr, "env.")
+				val = os.Getenv(varName)
+			} else {
+				return "", fmt.Errorf("unrecognized expression %q in pattern %q", expr, pattern)
+			}
+		}
+		out.WriteString(val)
 	}
 
-	s = strings.Replace(s, "${USER}", sanitizedUsername, -1)
+	s := out.String()
+	if s == "" {
+		return "", fmt.Errorf("project name pattern %q expanded to empty string", pattern)
+	}
+
+	// GCP project IDs must be lowercase.
 	s = strings.ToLower(s)
+	// Note: We are not fully sanitizing the project ID here.
+	// The user is responsible for ensuring environment variables result in a valid GCP project ID.
+	// A valid ID contains lowercase letters, numbers, and hyphens.
 	return s, nil
 }
