@@ -1,0 +1,10 @@
+# config/default.yaml
+namePattern: "default-${USER}-YYYYMMDD"
+parent: "folders/1234567890"
+billingAccount: "billingAccounts/012345-67890A-BCDEF0"
+services:
+  - "compute.googleapis.com"
+  - "container.googleapis.com"
+setupCommands:
+  - "gcloud container clusters create-auto my-cluster --project=${PROJECT_ID} --region=us-central1"
+  - "gcloud compute instances create my-instance --project=${PROJECT_ID} --zone=us-central1-a"
