@@ -6,9 +6,15 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
+	"google.golang.org/api/option"
+
+	serviceusage "cloud.google.com/go/serviceusage/apiv1"
+	"cloud.google.com/go/serviceusage/apiv1/serviceusagepb"
+	"google.golang.org/api/cloudbilling/v1"
 	"google.golang.org/api/cloudresourcemanager/v3"
 	"google.golang.org/api/googleapi"
 	"k8s.io/klog/v2"
@@ -60,6 +66,7 @@ func (p *ProjectManager) EnsureProjectExists(ctx context.Context, projectName st
 	} else {
 		log.Info("project already exists", "name", projectName)
 	}
+
 	return nil
 }
 
@@ -102,8 +109,23 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	// TODO: Enable services
-	// TODO: Run setup commands
+	// Ensure cloudbilling.googleapis.com is enabled first so we can set up billing
+	if err := projectManager.EnableProjectServices(ctx, projectName, []string{"cloudbilling.googleapis.com"}); err != nil {
+		return err
+	}
+
+	if err := projectManager.LinkProjectToBillingAccount(ctx, projectName); err != nil {
+		return err
+	}
+
+	if err := projectManager.EnableProjectServices(ctx, projectName, config.Services); err != nil {
+		return err
+	}
+
+	if err := projectManager.RunSetupCommands(ctx, projectName); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -153,6 +175,98 @@ func (p *ProjectManager) getProject(ctx context.Context, projectName string) (*c
 		return nil, fmt.Errorf("error getting project: %w", err)
 	}
 	return resp, nil
+}
+
+func (p *ProjectManager) LinkProjectToBillingAccount(ctx context.Context, projectName string) error {
+	log := klog.FromContext(ctx)
+
+	billingService, err := cloudbilling.NewService(ctx, option.WithQuotaProject(projectName))
+	if err != nil {
+		return fmt.Errorf("error creating cloudbilling client: %w", err)
+	}
+
+	// Check if already linked
+	currentBillingInfo, err := billingService.Projects.GetBillingInfo("projects/" + projectName).Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("error getting current billing info for project %q: %w", projectName, err)
+	}
+
+	if currentBillingInfo.BillingAccountName == p.config.BillingAccount && currentBillingInfo.BillingEnabled {
+		log.Info("project already linked to billing account", "project", projectName, "billingAccount", p.config.BillingAccount)
+		return nil
+	}
+
+	log.Info("linking project to billing account", "project", projectName, "billingAccount", p.config.BillingAccount)
+
+	projectBillingInfo := &cloudbilling.ProjectBillingInfo{
+		BillingAccountName: p.config.BillingAccount,
+		BillingEnabled:     true,
+	}
+
+	_, err = billingService.Projects.UpdateBillingInfo("projects/"+projectName, projectBillingInfo).Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("error linking project %q to billing account %q: %w", projectName, p.config.BillingAccount, err)
+	}
+
+	log.Info("project linked to billing account", "project", projectName, "billingAccount", p.config.BillingAccount)
+	return nil
+}
+
+func (p *ProjectManager) EnableProjectServices(ctx context.Context, projectName string, servicesToEnable []string) error {
+	log := klog.FromContext(ctx)
+
+	suClient, err := serviceusage.NewClient(ctx)
+	if err != nil {
+		return fmt.Errorf("error creating serviceusage client: %w", err)
+	}
+	defer suClient.Close()
+
+	if len(servicesToEnable) == 0 {
+		log.Info("no services to enable", "project", projectName)
+		return nil
+	}
+
+	log.Info("enabling services", "services", servicesToEnable, "project", projectName)
+	req := &serviceusagepb.BatchEnableServicesRequest{
+		Parent:     fmt.Sprintf("projects/%s", projectName),
+		ServiceIds: servicesToEnable,
+	}
+
+	op, err := suClient.BatchEnableServices(ctx, req)
+	if err != nil {
+		return fmt.Errorf("error starting batch enable services operation: %w", err)
+	}
+
+	_, err = op.Wait(ctx)
+	if err != nil {
+		return fmt.Errorf("error waiting for batch enable services operation: %w", err)
+	}
+
+	log.Info("services enabled", "services", servicesToEnable, "project", projectName)
+	return nil
+}
+
+func (p *ProjectManager) RunSetupCommands(ctx context.Context, projectName string) error {
+	log := klog.FromContext(ctx)
+
+	if len(p.config.SetupCommands) == 0 {
+		log.Info("no setup commands to run", "project", projectName)
+		return nil
+	}
+
+	log.Info("running setup commands", "project", projectName)
+	for _, command := range p.config.SetupCommands {
+		expandedCommand := strings.ReplaceAll(command, "${PROJECT_ID}", projectName)
+		log.Info("running command", "command", expandedCommand, "project", projectName)
+		cmd := exec.Command("bash", "-c", expandedCommand)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("error running setup command %q: %w", expandedCommand, err)
+		}
+	}
+	log.Info("setup commands completed", "project", projectName)
+	return nil
 }
 
 func isNotFound(err error) bool {
